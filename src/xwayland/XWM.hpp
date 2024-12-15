@@ -49,6 +49,7 @@ struct SXSelection {
     void             onSelection();
     bool             sendData(xcb_selection_request_event_t* e, std::string mime);
     int              onRead(int fd, uint32_t mask);
+    int              onWrite(int fd, uint32_t mask);
 
     struct {
         CHyprSignalListener setSelection;
@@ -140,7 +141,7 @@ class CXWM {
     void                 updateClientList();
 
     void                 sendDndEvent(SP<CWLSurfaceResource> destination, xcb_atom_t type, xcb_client_message_data_t& data);
-
+    void                 weston_wm_write_property(SXSelection& sel);
     // event handlers
     void         handleCreate(xcb_create_notify_event_t* e);
     void         handleDestroy(xcb_destroy_notify_event_t* e);

@@ -17,6 +17,7 @@
 #include "../managers/SeatManager.hpp"
 #include "../protocols/XWaylandShell.hpp"
 #include "../protocols/core/Compositor.hpp"
+#include "XWM.hpp"
 
 #define XCB_EVENT_RESPONSE_TYPE_MASK 0x7f
 #define INCR_CHUNK_SIZE              (64 * 1024)
@@ -566,7 +567,7 @@ std::string CXWM::mimeFromAtom(xcb_atom_t atom) {
 
 void CXWM::handleSelectionNotify(xcb_selection_notify_event_t* e) {
     Debug::log(TRACE, "[xwm] Selection notify for {} prop {} target {}", e->selection, e->property, e->target);
-
+    printf("X11 -> Wayland Clipboard\n");
     SXSelection* sel = getSelection(e->selection);
 
     if (e->property == XCB_ATOM_NONE) {
@@ -580,9 +581,9 @@ void CXWM::handleSelectionNotify(xcb_selection_notify_event_t* e) {
             return;
         }
 
-        setClipboardToWayland(*sel);
+        setClipboardToWayland(*sel); // weston_wm_get_selection_targets
     } else if (sel->transfer)
-        getTransferData(*sel);
+        getTransferData(*sel); // weston_wm_get_selection_data
 }
 
 bool CXWM::handleSelectionPropertyNotify(xcb_property_notify_event_t* e) {
@@ -1143,8 +1144,9 @@ void CXWM::initSelection() {
     xcb_change_property(connection, XCB_PROP_MODE_REPLACE, dndSelection.window, HYPRATOMS["XdndAware"], XCB_ATOM_ATOM, 32, 1, &val1);
 }
 
-void CXWM::setClipboardToWayland(SXSelection& sel) {
+void CXWM::setClipboardToWayland(SXSelection& sel) { // weston_wm_get_selection_targets
     auto source = makeShared<CXDataSource>(sel);
+
     if (source->mimes().empty()) {
         Debug::log(ERR, "[xwm] can't set clipboard: no MIMEs");
         return;
@@ -1156,37 +1158,40 @@ void CXWM::setClipboardToWayland(SXSelection& sel) {
     g_pSeatManager->setCurrentSelection(sel.dataSource);
 }
 
-void CXWM::getTransferData(SXSelection& sel) {
+void CXWM::getTransferData(SXSelection& sel) { // weston_wm_get_selection_data
     Debug::log(LOG, "[xwm] getTransferData");
 
     sel.transfer->getIncomingSelectionProp(true);
 
     if (sel.transfer->propertyReply->type == HYPRATOMS["INCR"]) {
         Debug::log(ERR, "[xwm] Transfer is INCR, which we don't support :(");
+        sel.transfer->incremental = true;
         close(sel.transfer->wlFD);
         sel.transfer.reset();
         return;
     } else {
-        char*   property  = (char*)xcb_get_property_value(sel.transfer->propertyReply);
-        int     remainder = xcb_get_property_value_length(sel.transfer->propertyReply) - sel.transfer->propertyStart;
+        sel.transfer->incremental = false;
+        weston_wm_write_property(sel);
+        // char*   property  = (char*)xcb_get_property_value(sel.transfer->propertyReply);
+        // int     remainder = xcb_get_property_value_length(sel.transfer->propertyReply) - sel.transfer->propertyStart;
 
-        ssize_t len = write(sel.transfer->wlFD, property + sel.transfer->propertyStart, remainder);
-        if (len == -1) {
-            Debug::log(ERR, "[xwm] write died in transfer get");
-            close(sel.transfer->wlFD);
-            sel.transfer.reset();
-            return;
-        }
+        // ssize_t len = write(sel.transfer->wlFD, property + sel.transfer->propertyStart, remainder);
+        // if (len == -1) {
+        //     Debug::log(ERR, "[xwm] write died in transfer get");
+        //     close(sel.transfer->wlFD);
+        //     sel.transfer.reset();
+        //     return;
+        // }
 
-        if (len < remainder) {
-            sel.transfer->propertyStart += len;
-            Debug::log(ERR, "[xwm] wl client read partially: len {}", len);
-            return;
-        } else {
-            Debug::log(LOG, "[xwm] cb transfer to wl client complete, read {} bytes", len);
-            close(sel.transfer->wlFD);
-            sel.transfer.reset();
-        }
+        // if (len < remainder) {
+        //     sel.transfer->propertyStart += len;
+        //     Debug::log(ERR, "[xwm] wl client read partially: len {}", len);
+        //     return;
+        // } else {
+        //     Debug::log(LOG, "[xwm] cb transfer to wl client complete, read {} bytes", len);
+        //     close(sel.transfer->wlFD);
+        //     sel.transfer.reset();
+        // }
     }
 }
 
@@ -1246,6 +1251,24 @@ void CXWM::sendDndEvent(SP<CWLSurfaceResource> destination, xcb_atom_t type, xcb
     xcb_flush(g_pXWayland->pWM->connection);
 }
 
+static int writable_callback(int fd, uint32_t mask, void *data) {
+    Debug::log(LOG, "[xwm] writable_callback on fd {}", fd);
+    auto selection = (SXSelection*)data;
+
+    return selection->onWrite(fd, mask);
+}
+
+void CXWM::weston_wm_write_property(SXSelection& sel) {
+	writable_callback(sel.transfer->wlFD, WL_EVENT_WRITABLE, &sel);
+
+	if (sel.transfer->propertyReply)
+		sel.transfer->eventSource =
+			wl_event_loop_add_fd(g_pCompositor->m_sWLEventLoop,
+					     sel.transfer->wlFD,
+					     WL_EVENT_WRITABLE,
+					     writable_callback, &sel);
+}
+
 SP<CX11DataDevice> CXWM::getDataDevice() {
     return dndDataDevice;
 }
@@ -1269,7 +1292,8 @@ SP<IDataOffer> CXWM::createX11DataOffer(SP<CWLSurfaceResource> surf, SP<IDataSou
     return offer;
 }
 
-void SXSelection::onSelection() {
+void SXSelection::onSelection() { // wayland -> x11
+    printf("Wayland -> x11 Clipboard\n");
     if (g_pSeatManager->selection.currentSelection && g_pSeatManager->selection.currentSelection->type() == DATA_SOURCE_TYPE_X11)
         return;
 
@@ -1308,6 +1332,50 @@ int SXSelection::onRead(int fd, uint32_t mask) {
     return 1;
 }
 
+int SXSelection::onWrite(int fd, uint32_t mask) {
+	unsigned char *property;
+	int len, remainder;
+
+	property = (unsigned char*)xcb_get_property_value(transfer->propertyReply);
+	remainder = xcb_get_property_value_length(transfer->propertyReply) -
+		transfer->propertyStart;
+
+	len = write(fd, property + transfer->propertyStart, remainder);
+	if (len == -1) {
+		free(transfer->propertyReply);
+		transfer->propertyReply = NULL;
+		if (transfer->eventSource)
+			wl_event_source_remove(transfer->eventSource);
+		transfer->eventSource = NULL;
+		close(fd);
+		printf("write error to target fd: %s\n", strerror(errno));
+        return 1;
+	}
+
+	printf("wrote %d (chunk size %d) of %d bytes\n",
+		transfer->propertyStart + len,
+		len, xcb_get_property_value_length(transfer->propertyReply));
+    
+	transfer->propertyStart += len;
+	if (len == remainder) {
+		free(transfer->propertyReply);
+		transfer->propertyReply = NULL;
+		if (transfer->eventSource)
+			wl_event_source_remove(transfer->eventSource);
+		transfer->eventSource = NULL;
+
+		if (transfer->incremental) {
+			xcb_delete_property(g_pXWayland->pWM->connection,
+					    window,
+					    HYPRATOMS["_WL_SELECTION"]);
+		} else {
+			printf("transfer complete\n");
+			close(fd);
+		}
+	}
+	return 1;
+}
+
 static int readDataSource(int fd, uint32_t mask, void* data) {
     Debug::log(LOG, "[xwm] readDataSource on fd {}", fd);
 
@@ -1315,6 +1383,7 @@ static int readDataSource(int fd, uint32_t mask, void* data) {
 
     return selection->onRead(fd, mask);
 }
+
 
 bool SXSelection::sendData(xcb_selection_request_event_t* e, std::string mime) {
     WP<IDataSource> selection;
